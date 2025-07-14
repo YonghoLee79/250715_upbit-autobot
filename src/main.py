@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from upbit_api import UpbitAPI
 from strategy import simple_monthly_target_strategy
 from portfolio import get_krw_markets, get_monthly_returns, select_portfolio
+import statistics
 
 # 환경변수 로드
 load_dotenv()
@@ -80,13 +81,12 @@ def main():
             time.sleep(60)
             continue
 
-        # 2단계 리스크 관리: 최대 투자 비중, 최대 손실 제한
-        # 1) 한 종목 최대 투자 비중 제한 (예: 전체 자산의 20% 이하)
+        # 여기에 선언!
         max_per_coin = total_krw * 0.2
-        # 2) 전체 자산의 최대 손실 제한 (예: -10% 이상 손실 시 전체 현금화)
-        # 최초 실행 시 기준 자산 저장
-        if not hasattr(main, 'initial_krw'):
-            main.initial_krw = total_krw
+
+        # 기준자산을 매번 현재 자산으로 갱신
+        main.initial_krw = total_krw
+
         loss_rate = (total_krw - main.initial_krw) / main.initial_krw
         msg = f"누적 수익률: {loss_rate*100:.2f}% (기준자산: {main.initial_krw:.2f} KRW)"
         print(msg)

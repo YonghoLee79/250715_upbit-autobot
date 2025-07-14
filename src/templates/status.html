@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>실시간 자동매매 상태 대시보드</title>
+    <style>
+        table { border-collapse: collapse; }
+        th, td { border: 1px solid #aaa; padding: 8px; }
+    </style>
+</head>
+<body>
+    <h2>실시간 자동매매 상태</h2>
+    <table>
+        <tr>
+            <th>코인</th>
+            <th>매수가</th>
+            <th>보유수량</th>
+            <th>최근 매매가</th>
+        </tr>
+        {% for coin, state in coin_states.items() %}
+        <tr>
+            <td>{{ coin }}</td>
+            <td>{{ state.buy_price }}</td>
+            <td>{{ state.bought_volume }}</td>
+            <td>{{ state.last_trade_price }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <p>페이지 새로고침(F5)으로 최신 상태를 확인하세요.</p>
+</body>
+</html>

@@ -6,6 +6,7 @@ from backtest.report import BacktestReport
 from auto_optimizer import auto_optimize
 from ai_verifier import AIVerifier
 from telegram_alert import TelegramAlert
+from upbit_api import UpbitAPI
 import matplotlib.pyplot as plt
 
 plt.rcParams['font.family'] = 'AppleGothic'
@@ -50,7 +51,7 @@ def main():
     ]
     best_param, best_history = auto_optimize(example_strategy, data_dict, rebalance_dates, param_grid)
 
-    # 2. AI 기반 전략 추천
+    # 2. AI 기반 전략 추천 및 검증
     ai = AIVerifier(openai_api_key=os.getenv("OPENAI_API_KEY"))
     prompt = "최근 3개월 비트코인, 이더리움, 리플의 가격 변동과 시장 상황을 요약하고, 자동매매 전략을 추천해줘."
     is_positive, answer = ai.llm_check(prompt)
@@ -67,6 +68,25 @@ def main():
     if telegram_token and telegram_chat_id:
         tg = TelegramAlert(telegram_token, telegram_chat_id)
         tg.send(f"[백테스트 결과]\n최적 파라미터: {best_param}\n누적 수익률: {summary_text}\nAI 전략 추천: {answer}")
+
+    # 5. 실매매 연동 (AI 검증 통과 시)
+    if is_positive:
+        print("AI 검증 통과! 실매매를 실행합니다.")
+        access_key = os.getenv("UPBIT_ACCESS_KEY")
+        secret_key = os.getenv("UPBIT_SECRET_KEY")
+        upbit = UpbitAPI(access_key, secret_key)
+        # 예시: 비트코인 시장가 10,000원 매수
+        try:
+            order_result = upbit.buy_market_order("KRW-ETH", 20000)
+            print("실매매 주문 결과:", order_result)
+            if telegram_token and telegram_chat_id:
+                tg.send(f"실매매 주문 완료: KRW-ETH 20,000원 시장가 매수\n{order_result}")
+        except Exception as e:
+            print("실매매 주문 오류:", e)
+            if telegram_token and telegram_chat_id:
+                tg.send(f"실매매 주문 오류: {e}")
+    else:
+        print("AI 검증 미통과. 실매매를 실행하지 않습니다.")
 
 if __name__ == '__main__':
     main()
