@@ -9,6 +9,8 @@ import math
 import datetime
 import requests
 from telegram_alert import TelegramAlert
+import json
+from flask import Flask, render_template
 
 # 환경변수 로드
 load_dotenv()
@@ -30,6 +32,28 @@ trade_count_per_day = {}
 MIN_EXPECTED_PROFIT = 0.003
 # 1일 최대 매매 횟수 제한
 MAX_TRADES_PER_DAY = 10
+
+state_path = "coin_states.json"
+
+app = Flask(__name__, template_folder='templates')
+
+@app.route('/')
+def status():
+    state_path = os.path.join(os.path.dirname(__file__), "coin_states.json")
+    with open(state_path) as f:
+        coin_states = json.load(f)
+    return render_template("status.html", coin_states=coin_states)
+
+def load_coin_states():
+    try:
+        with open(state_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_coin_states(states):
+    with open(state_path, "w") as f:
+        json.dump(states, f, ensure_ascii=False, indent=2)
 
 def simple_monthly_target_strategy(balance, ticker, trading_fee, exchange_fee):
     """
@@ -54,35 +78,65 @@ def simple_monthly_target_strategy(balance, ticker, trading_fee, exchange_fee):
 def get_today():
     return datetime.datetime.now().strftime("%Y-%m-%d")
 
+def safe_api_call(func, *args, **kwargs):
+    for _ in range(3):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"API 오류: {e}")
+            time.sleep(5)
+    print(f"[치명적 오류] {func.__name__} 3회 연속 실패")
+    # 텔레그램/이메일 알림 등 추가
+    return None
+
+def check_order_status(api, uuid):
+    # 업비트 주문 조회 API 사용
+    order = safe_api_call(api.get_order, uuid)
+    if order is None:
+        return "unknown"
+    if order['state'] == 'done':
+        return "filled"
+    elif order['state'] == 'wait':
+        return "pending"
+    elif order['state'] == 'cancel':
+        return "cancelled"
+    else:
+        return order['state']
+
 def main():
     print(f"업비트 자동매매 오토봇 시작: {UPBIT_MARKET}")
     if not UPBIT_ACCESS_KEY or not UPBIT_SECRET_KEY:
         raise ValueError("UPBIT_ACCESS_KEY와 UPBIT_SECRET_KEY를 .env에 설정하세요.")
     api = UpbitAPI(str(UPBIT_ACCESS_KEY), str(UPBIT_SECRET_KEY))
-    # 텔레그램 알림 설정 (환경변수 또는 직접 입력)
     TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     tg = None
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         tg = TelegramAlert(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
     while True:
-        # 업비트 전체 자산(원화+코인) 평가금액 계산
-        balances = api.get_balance()
-        total_krw = 0.0
+        # 1. 잔고조회에 예외처리 적용
+        balances = safe_api_call(api.get_balance)
+        if balances is None:
+            continue
+
+        # 2. 시세조회에 예외처리 적용
         tickers = []
+        total_krw = 0.0
         for b in balances:
             if b['currency'] == 'KRW':
                 total_krw += float(b['balance'])
             elif float(b['balance']) > 0:
                 tickers.append(f"KRW-{b['currency']}")
-        # 코인 평가금액 합산
         if tickers:
-            prices = api.get_ticker(",".join(tickers))
+            prices = safe_api_call(api.get_ticker, ",".join(tickers))
+            if prices is None:
+                continue
             if isinstance(prices, dict):
                 prices = [prices]
             for b, t in zip(balances, prices):
                 if b['currency'] == t['market'].split('-')[1]:
                     total_krw += float(b['balance']) * float(t['trade_price'])
+
         msg = f"[업비트 오토봇] 전체 평가금액(원화+코인): {total_krw:.2f} KRW"
         print(msg)
         if tg:
@@ -141,15 +195,25 @@ def main():
             candles = res.json()
             if len(candles) < 30:
                 continue
-            price_30d_ago = candles[-1]['trade_price']
-            price_now = candles[0]['trade_price']
-            ret = (price_now - price_30d_ago) / price_30d_ago
-            # 변동성(표준편차), 거래량평균
             prices = [c['trade_price'] for c in candles]
             vols = [c['candle_acc_trade_price'] for c in candles]
+            price_30d_ago = prices[-1]
+            price_now = prices[0]
+            ret = (price_now - price_30d_ago) / price_30d_ago
             volatility = statistics.stdev(prices)
             avg_vol = statistics.mean(vols)
-            # RSI(14) 계산
+
+            # 이동평균 (MA5, MA20)
+            ma5 = sum(prices[:5]) / 5
+            ma20 = sum(prices[:20]) / 20
+
+            # 볼린저밴드 (20일)
+            bb_ma = ma20
+            bb_std = statistics.stdev(prices[:20])
+            bb_upper = bb_ma + 2 * bb_std
+            bb_lower = bb_ma - 2 * bb_std
+
+            # RSI 계산
             deltas = [prices[i] - prices[i+1] for i in range(len(prices)-1)]
             gains = [d for d in deltas if d > 0]
             losses = [-d for d in deltas if d < 0]
@@ -157,16 +221,38 @@ def main():
             avg_loss = sum(losses)/14 if len(losses)>=14 else 0.0001
             rs = avg_gain / avg_loss if avg_loss != 0 else 0
             rsi = 100 - (100 / (1 + rs))
-            # 하락장 반등 신호: RSI 30 이하 종목만 별도 추림
-            if rsi < 30:
-                rsi_targets.append({"market": market, "rsi": rsi, "ret": ret, "vol": avg_vol})
+
+            # 트레일링 스탑(예시: 10% 이상 수익 후 고점 대비 5% 하락 시 매도)
+            trailing_stop = False
+            if market in coin_states and coin_states[market]["buy_price"]:
+                buy_price = coin_states[market]["buy_price"]
+                highest = max(prices)
+                if price_now > buy_price * 1.10 and price_now < highest * 0.95:
+                    trailing_stop = True
+
+            # 고급 스코어 계산
+            score = (
+                ret * 0.4 +  # 수익률
+                ((ma5 - ma20) / ma20) * 0.2 +  # 단기/장기 이동평균 갭
+                (rsi < 30) * 0.1 +  # 과매도 신호
+                ((price_now < bb_lower) * 0.1) +  # 볼린저밴드 하단 돌파
+                (avg_vol/1e9) * 0.1 -  # 거래량
+                (volatility/abs(ret) if ret!=0 else 0) * 0.1  # 변동성
+            )
             returns.append({
                 "market": market,
                 "return": ret,
                 "volatility": volatility,
                 "avg_vol": avg_vol,
-                "rsi": rsi
+                "rsi": rsi,
+                "ma5": ma5,
+                "ma20": ma20,
+                "bb_upper": bb_upper,
+                "bb_lower": bb_lower,
+                "score": score,
+                "trailing_stop": trailing_stop
             })
+
         # 전체 시장 평균 수익률로 하락장 필터링
         market_avg = statistics.mean([r['return'] for r in returns])
         today = get_today()
@@ -219,6 +305,23 @@ def main():
                     print(msg)
                     if tg:
                         tg.send(msg)
+                    # 매수/매도 직후에 아래 코드 추가
+                    coin_states = load_coin_states()
+                    m = t['market']
+                    if m not in coin_states:
+                        coin_states[m] = {
+                            "buy_price": None,
+                            "bought_volume": 0,
+                            "last_trade_time": 0,
+                            "trade_count_today": 0,
+                            "order_status": ""
+                        }
+                    coin_states[m]["buy_price"] = buy_result.get("price") if isinstance(buy_result, dict) else None
+                    coin_states[m]["bought_volume"] = buy_result.get("volume") if isinstance(buy_result, dict) else None
+                    coin_states[m]["last_trade_time"] = now
+                    coin_states[m]["trade_count_today"] = trade_count_per_day[today][m]
+                    coin_states[m]["order_status"] = "filled"  # 실제 체결 상태로 변경 가능
+                    save_coin_states(coin_states)
             else:
                 print("RSI 30 이하 반등 신호 종목 없음. 현금 대기.")
         else:
@@ -271,6 +374,39 @@ def main():
                 print(msg)
                 if tg:
                     tg.send(msg)
+                # 매수/매도 직후에 아래 코드 추가
+                coin_states = load_coin_states()
+                m = p['market']
+                if m not in coin_states:
+                    coin_states[m] = {
+                        "buy_price": None,
+                        "bought_volume": 0,
+                        "last_trade_time": 0,
+                        "trade_count_today": 0,
+                        "order_status": ""
+                    }
+                coin_states[m]["buy_price"] = buy_result.get("price") if isinstance(buy_result, dict) else None
+                coin_states[m]["bought_volume"] = buy_result.get("volume") if isinstance(buy_result, dict) else None
+                coin_states[m]["last_trade_time"] = now
+                coin_states[m]["trade_count_today"] = trade_count_per_day[today][m]
+                coin_states[m]["order_status"] = "filled"  # 실제 체결 상태로 변경 가능
+                save_coin_states(coin_states)
+            # 현재 보유 코인 목록
+            current_holdings = [b['currency'] for b in balances if b['currency'] != 'KRW' and float(b['balance']) > 0]
+            # 새 포트폴리오에 없는 코인은 전량 매도
+            for holding in current_holdings:
+                market = f"KRW-{holding}"
+                if market not in [p['market'] for p in portfolio]:
+                    msg = f"{market} : 포트폴리오 제외, 전량 매도"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+                    sell_result = api.sell_market_order(market, float([b for b in balances if b['currency'] == holding][0]['balance']))
+                    msg = f"매도 결과: {sell_result}"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+            # 이후 새 포트폴리오 종목만 매수
         print("1분 후 다시 확인합니다...\n")
         time.sleep(60)
 
