@@ -4,6 +4,11 @@ from upbit_api import UpbitAPI
 from strategy import simple_monthly_target_strategy
 from portfolio import get_krw_markets, get_monthly_returns, select_portfolio
 import statistics
+import time
+import math
+import datetime
+import requests
+from telegram_alert import TelegramAlert
 
 # 환경변수 로드
 load_dotenv()
@@ -16,6 +21,15 @@ START_BALANCE = 100000
 # 수수료 설정 (업비트 기준)
 TRADING_FEE = 0.0005  # 0.05%
 EXCHANGE_FEE = 0.001  # 예시 환전 수수료 0.1%
+
+# 매매 기록용 딕셔너리 및 횟수 제한
+last_trade_time = {}
+trade_count_per_day = {}
+
+# 최소 기대수익률(예: 0.3%)
+MIN_EXPECTED_PROFIT = 0.003
+# 1일 최대 매매 횟수 제한
+MAX_TRADES_PER_DAY = 10
 
 def simple_monthly_target_strategy(balance, ticker, trading_fee, exchange_fee):
     """
@@ -37,11 +51,8 @@ def simple_monthly_target_strategy(balance, ticker, trading_fee, exchange_fee):
     return {'action': action, 'amount': amount}
 
 
-import math
-import datetime
-import requests
-import time
-from telegram_alert import TelegramAlert
+def get_today():
+    return datetime.datetime.now().strftime("%Y-%m-%d")
 
 def main():
     print(f"업비트 자동매매 오토봇 시작: {UPBIT_MARKET}")
@@ -158,6 +169,9 @@ def main():
             })
         # 전체 시장 평균 수익률로 하락장 필터링
         market_avg = statistics.mean([r['return'] for r in returns])
+        today = get_today()
+        if today not in trade_count_per_day:
+            trade_count_per_day[today] = {}
         if market_avg < -0.05:
             print("시장 전체가 하락장입니다. 현금 비중을 80%로 유지하고, RSI 30 이하 반등 신호 종목만 소액 매수/코인빌려주기 실행")
             # 현금 80% 유지, 20%만 rsi_targets에 분산
@@ -165,17 +179,46 @@ def main():
             if rsi_targets:
                 amount_per_coin = max(5000, min(invest_amount // len(rsi_targets), max_per_coin))
                 for t in rsi_targets:
+                    now = time.time()
+                    # 30분 이내 동일 코인 재매매 방지
+                    if t['market'] in last_trade_time and now - last_trade_time[t['market']] < 1800:
+                        msg = f"{t['market']} : 최근 30분 내 매매 이력, 매수 생략"
+                        print(msg)
+                        if tg:
+                            tg.send(msg)
+                        continue
+                    # 1일 최대 매매 횟수 제한
+                    if trade_count_per_day[today].get(t['market'], 0) >= MAX_TRADES_PER_DAY:
+                        msg = f"{t['market']} : 1일 최대 매매 횟수 초과, 매수 생략"
+                        print(msg)
+                        if tg:
+                            tg.send(msg)
+                        continue
+                    # 최소 기대수익률 조건(예시: 0.3%)
+                    expected_profit = t['ret']
+                    if expected_profit < MIN_EXPECTED_PROFIT:
+                        msg = f"{t['market']} : 기대수익률 {expected_profit*100:.2f}% 미만, 매수 생략"
+                        print(msg)
+                        if tg:
+                            tg.send(msg)
+                        continue
+                    if amount_per_coin < 5000:
+                        msg = f"{t['market']} : {amount_per_coin} KRW (최소주문금액 미만, 매수 생략)"
+                        print(msg)
+                        if tg:
+                            tg.send(msg)
+                        continue
                     msg = f"[반등신호] {t['market']} : {amount_per_coin} KRW 매수 시도 및 코인빌려주기(렌딩) 실행"
                     print(msg)
                     if tg:
                         tg.send(msg)
                     buy_result = api.buy_market_order(t['market'], amount_per_coin)
+                    last_trade_time[t['market']] = now
+                    trade_count_per_day[today][t['market']] = trade_count_per_day[today].get(t['market'], 0) + 1
                     msg = f"실제 매수 결과: {buy_result}"
                     print(msg)
                     if tg:
                         tg.send(msg)
-                    # 코인빌려주기(렌딩) API 호출 예시 (실제 구현 필요)
-                    # api.lending_coin(t['market'], amount_per_coin)
             else:
                 print("RSI 30 이하 반등 신호 종목 없음. 현금 대기.")
         else:
@@ -188,17 +231,59 @@ def main():
             print("추천 포트폴리오:")
             for p in portfolio:
                 amount = min(p['amount'], max_per_coin)
+                now = time.time()
+                # 30분 이내 동일 코인 재매매 방지
+                if p['market'] in last_trade_time and now - last_trade_time[p['market']] < 1800:
+                    msg = f"{p['market']} : 최근 30분 내 매매 이력, 매수 생략"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+                    continue
+                # 1일 최대 매매 횟수 제한
+                if trade_count_per_day[today].get(p['market'], 0) >= MAX_TRADES_PER_DAY:
+                    msg = f"{p['market']} : 1일 최대 매매 횟수 초과, 매수 생략"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+                    continue
+                # 최소 기대수익률 조건(예시: 0.3%)
+                expected_profit = p['return']
+                if expected_profit < MIN_EXPECTED_PROFIT:
+                    msg = f"{p['market']} : 기대수익률 {expected_profit*100:.2f}% 미만, 매수 생략"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+                    continue
+                if amount < 5000:
+                    msg = f"{p['market']} : {amount} KRW (최소주문금액 미만, 매수 생략)"
+                    print(msg)
+                    if tg:
+                        tg.send(msg)
+                    continue
                 msg = f"{p['market']} : {amount} KRW (최대비중 적용)"
                 print(msg)
                 if tg:
                     tg.send(msg)
                 buy_result = api.buy_market_order(p['market'], amount)
+                last_trade_time[p['market']] = now
+                trade_count_per_day[today][p['market']] = trade_count_per_day[today].get(p['market'], 0) + 1
                 msg = f"실제 매수 결과: {buy_result}"
                 print(msg)
                 if tg:
                     tg.send(msg)
-        print("10분 후 다시 확인합니다...\n")
-        time.sleep(600)
+        print("1분 후 다시 확인합니다...\n")
+        time.sleep(60)
+
+def select_portfolio(returns, total_krw, min_amount=5000, top_n=5):
+    selected = []
+    for r in returns[:top_n]:
+        amount = max(min_amount, total_krw // top_n)
+        selected.append({
+            'market': r['market'],
+            'amount': amount,
+            'return': r['return']  # ← 이 부분 추가
+        })
+    return selected
 
 if __name__ == "__main__":
     main()
