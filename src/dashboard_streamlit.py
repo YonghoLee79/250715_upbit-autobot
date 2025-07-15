@@ -1,10 +1,15 @@
+
 import streamlit as st
 import json
 import os
 import pandas as pd
 import time
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="업비트 자동매매 대시보드", layout="wide")
+
+# 1분(60,000ms)마다 자동 새로고침
+st_autorefresh(interval=60 * 1000, key="datarefresh")
 
 state_path = os.path.join(os.path.dirname(__file__), "coin_states.json")
 

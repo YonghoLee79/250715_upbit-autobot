@@ -1,3 +1,33 @@
+def send_kakao_message(text):
+    """
+    카카오톡 알림톡/친구톡/푸시 메시지 전송 예시 (실제 사용시 카카오 비즈니스 인증, 토큰, 발신자/수신자 세팅 필요)
+    환경변수에 KAKAO_TOKEN, KAKAO_PHONE, KAKAO_SENDER_KEY 등 필요
+    """
+    import os
+    import requests
+    KAKAO_TOKEN = os.getenv('KAKAO_TOKEN', '')
+    KAKAO_PHONE = os.getenv('KAKAO_PHONE', '')  # 본인 전화번호 (수신자)
+    KAKAO_SENDER_KEY = os.getenv('KAKAO_SENDER_KEY', '')  # 플러스친구/알림톡 발신 프로필 키
+    if not (KAKAO_TOKEN and KAKAO_PHONE and KAKAO_SENDER_KEY):
+        print('[카카오톡] 환경변수 미설정, 메시지 전송 생략')
+        return
+    url = 'https://kakaoapi.aligo.in/akv10/alimtalk/send/'  # 예시: 알리고 알림톡 API
+    data = {
+        'apikey': KAKAO_TOKEN,
+        'userid': 'your_aligo_id',  # 알리고 계정 ID
+        'senderkey': KAKAO_SENDER_KEY,
+        'tpl_code': 'KA01TP230123456789',  # 템플릿 코드(사전 등록 필요)
+        'sender': '발신번호',
+        'receiver_1': KAKAO_PHONE,
+        'recvname_1': '본인',
+        'subject_1': '업비트 오토봇',
+        'message_1': text,
+    }
+    try:
+        r = requests.post(url, data=data)
+        print('[카카오톡] 전송 결과:', r.text)
+    except Exception as e:
+        print('[카카오톡] 전송 오류:', e)
 import os
 from dotenv import load_dotenv
 from upbit_api import UpbitAPI
@@ -11,8 +41,7 @@ import requests
 from telegram_alert import TelegramAlert
 import json
 from flask import Flask, render_template
-import smtplib
-from email.mime.text import MIMEText
+
 import csv
 import streamlit as st
 
@@ -107,25 +136,7 @@ def check_order_status(api, uuid):
     else:
         return order['state']
 
-def send_error_mail(subject, body):
-    import os
-    EMAIL_HOST = os.getenv('EMAIL_HOST')
-    EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
-    EMAIL_USER = os.getenv('EMAIL_USER')
-    EMAIL_PASS = os.getenv('EMAIL_PASS')
-    EMAIL_TO = os.getenv('EMAIL_TO')
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_USER
-    msg['To'] = EMAIL_TO
-    try:
-        s = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
-        s.starttls()
-        s.login(EMAIL_USER, EMAIL_PASS)
-        s.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
-        s.quit()
-    except Exception as e:
-        print(f"이메일 발송 실패: {e}")
+
 
 def save_trade_history(row):
     file_path = os.path.join(os.path.dirname(__file__), "trade_history.csv")
@@ -491,8 +502,42 @@ class UpbitBot:
                 coin_states[m]["trade_count_today"] = trade_count_per_day[today][m]
                 coin_states[m]["order_status"] = "filled"  # 실제 체결 상태로 변경 가능
                 save_coin_states(coin_states)
+
+            # --- 메일/텔레그램 알림: 수익 발생(익절/매도) 시 ---
+            buy_result = None
+            try:
+                # 알림 메시지 생성 전에 coin_states가 항상 정의되도록 보장
+                if 'coin_states' not in locals():
+                    coin_states = load_coin_states()
+                subject = "[업비트 오토봇 알림] 수익실현/매도"
+                m = market
+                buy_price = None
+                volume = None
+                sell_price = None
+                realized_profit = None
+                profit_rate = None
+                if m in coin_states:
+                    buy_price = coin_states[m].get("buy_price")
+                    volume = coin_states[m].get("bought_volume")
+                if isinstance(buy_result, dict):
+                    sell_price = buy_result.get("price")
+                    if not volume:
+                        volume = buy_result.get("volume")
+                if buy_price and sell_price and volume:
+                    realized_profit = (float(sell_price) - float(buy_price)) * float(volume)
+                    profit_rate = (float(sell_price) - float(buy_price)) / float(buy_price) * 100
+                body = f"{market} 매도, 수익 발생! (자동매매)\n"
+                if buy_price and sell_price and volume:
+                    body += f"매수가: {buy_price} / 매도가: {sell_price} / 수량: {volume}\n실현수익: {realized_profit:.0f}원 (수익률: {profit_rate:.2f}%)\n"
+                body += f"상세내역: {buy_result}"
+                # 메일 발송 코드 완전 삭제
+                if self.tg:
+                    self.tg.send(f"{subject}\n{body}")
+            except Exception as e:
+                print('[수익 알림 오류]', e)
             # 현재 보유 코인 목록
             current_holdings = [b['currency'] for b in balances if b['currency'] != 'KRW' and float(b['balance']) > 0]
+            coin_states = load_coin_states()  # ← UnboundLocalError 방지: 항상 정의
             # 새 포트폴리오에 없는 코인은 전량 매도
             for holding in current_holdings:
                 market = f"KRW-{holding}"
@@ -502,9 +547,73 @@ class UpbitBot:
                     if current_price > buy_price * 1.05:
                         amount = float([b for b in balances if b['currency'] == holding][0]['balance']) / 2
                         msg = f"{market} : 5% 이상 수익, 절반 익절"
+                        # --- 메일/텔레그램 알림: 수익 발생 ---
+                        subject = "[업비트 오토봇 알림] 수익실현/익절"
+                        # 매도 상세 정보 계산
+                        try:
+                            m = market
+                            buy_price = None
+                            volume = None
+                            sell_price = None
+                            realized_profit = None
+                            profit_rate = None
+                            if m in coin_states:
+                                buy_price = coin_states[m].get("buy_price")
+                                volume = coin_states[m].get("bought_volume")
+                            if isinstance(sell_result, dict):
+                                sell_price = sell_result.get("price")
+                                if not volume:
+                                    volume = sell_result.get("volume")
+                            if buy_price and sell_price and volume:
+                                realized_profit = (float(sell_price) - float(buy_price)) * float(volume)
+                                profit_rate = (float(sell_price) - float(buy_price)) / float(buy_price) * 100
+                            body = f"{market} 5% 이상 수익, 절반 익절!\n"
+                            if buy_price and sell_price and volume:
+                                body += f"매수가: {buy_price} / 매도가: {sell_price} / 수량: {volume}\n실현수익: {realized_profit:.0f}원 (수익률: {profit_rate:.2f}%)\n"
+                            body += f"상세내역: {sell_result if 'sell_result' in locals() else ''}"
+                        except Exception as e:
+                            body = f"{market} 5% 이상 수익, 절반 익절!\n상세내역: {sell_result if 'sell_result' in locals() else ''}"
+                        # 메일 발송 코드 완전 삭제
+                        try:
+                            if self.tg:
+                                self.tg.send(f"{subject}\n{body}")
+                        except Exception as e:
+                            print('[텔레그램] 수익 알림 실패:', e)
                     else:
                         amount = float([b for b in balances if b['currency'] == holding][0]['balance'])
                         msg = f"{market} : 포트폴리오 제외, 전량 매도"
+                        # --- 메일/텔레그램 알림: 포트폴리오 제외 매도 ---
+                        subject = "[업비트 오토봇 알림] 포트폴리오 제외 매도"
+                        # 매도 상세 정보 계산
+                        try:
+                            m = market
+                            buy_price = None
+                            volume = None
+                            sell_price = None
+                            realized_profit = None
+                            profit_rate = None
+                            if m in coin_states:
+                                buy_price = coin_states[m].get("buy_price")
+                                volume = coin_states[m].get("bought_volume")
+                            if isinstance(sell_result, dict):
+                                sell_price = sell_result.get("price")
+                                if not volume:
+                                    volume = sell_result.get("volume")
+                            if buy_price and sell_price and volume:
+                                realized_profit = (float(sell_price) - float(buy_price)) * float(volume)
+                                profit_rate = (float(sell_price) - float(buy_price)) / float(buy_price) * 100
+                            body = f"{market} 포트폴리오 제외, 전량 매도!\n"
+                            if buy_price and sell_price and volume:
+                                body += f"매수가: {buy_price} / 매도가: {sell_price} / 수량: {volume}\n실현수익: {realized_profit:.0f}원 (수익률: {profit_rate:.2f}%)\n"
+                            body += f"상세내역: {sell_result if 'sell_result' in locals() else ''}"
+                        except Exception as e:
+                            body = f"{market} 포트폴리오 제외, 전량 매도!\n상세내역: {sell_result if 'sell_result' in locals() else ''}"
+                        # 메일 발송 코드 완전 삭제
+                        try:
+                            if self.tg:
+                                self.tg.send(f"{subject}\n{body}")
+                        except Exception as e:
+                            print('[텔레그램] 매도 알림 실패:', e)
                     # 매도 실행
                     sell_result = self.api.sell_market_order(market, amount)
                     msg = f"매도 결과: {sell_result}"
@@ -541,13 +650,24 @@ if st.sidebar.button("적용"):
     st.success("전략 파라미터가 저장되었습니다.")
 
 if __name__ == "__main__":
-    # 메일 발송 테스트
+    # 메일/텔레그램 발송 테스트
+    # 메일 발송 테스트 비활성화, 텔레그램만 테스트
     try:
-        send_error_mail("테스트 메일", "업비트 오토봇 메일 발송 테스트입니다.")
-        print("테스트 메일이 정상적으로 발송되었습니다.")
+        from telegram_alert import TelegramAlert
+        import os
+        TelegramAlert(os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')).send('업비트 오토봇 텔레그램 발송 테스트입니다.')
     except Exception as e:
-        print(f"테스트 메일 발송 실패: {e}")
+        print(f"텔레그램 발송 테스트 실패: {e}")
 
     # 실제 자동매매 실행
-    bot = UpbitBot()
-    bot.run()
+    try:
+        bot = UpbitBot()
+        bot.run()
+    except Exception as e:
+        print(f"[오토봇 오류/정지] {e}")
+        # 메일 발송 코드 완전 삭제
+        try:
+            if 'bot' in locals() and hasattr(bot, 'tg') and bot.tg:
+                bot.tg.send(f"[업비트 오토봇 오류/정지]\n{str(e)}")
+        except Exception as e3:
+            print('[텔레그램] 오류/정지 알림 실패:', e3)
