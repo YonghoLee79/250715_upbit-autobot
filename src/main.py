@@ -11,6 +11,9 @@ import requests
 from telegram_alert import TelegramAlert
 import json
 from flask import Flask, render_template
+import smtplib
+from email.mime.text import MIMEText
+import csv
 
 # 환경변수 로드
 load_dotenv()
@@ -103,21 +106,70 @@ def check_order_status(api, uuid):
     else:
         return order['state']
 
-def main():
-    print(f"업비트 자동매매 오토봇 시작: {UPBIT_MARKET}")
-    if not UPBIT_ACCESS_KEY or not UPBIT_SECRET_KEY:
-        raise ValueError("UPBIT_ACCESS_KEY와 UPBIT_SECRET_KEY를 .env에 설정하세요.")
-    api = UpbitAPI(str(UPBIT_ACCESS_KEY), str(UPBIT_SECRET_KEY))
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-    tg = None
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        tg = TelegramAlert(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
-    while True:
+def send_error_mail(subject, body):
+    import os
+    EMAIL_HOST = os.getenv('EMAIL_HOST')
+    EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
+    EMAIL_USER = os.getenv('EMAIL_USER')
+    EMAIL_PASS = os.getenv('EMAIL_PASS')
+    EMAIL_TO = os.getenv('EMAIL_TO')
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = EMAIL_USER
+    msg['To'] = EMAIL_TO
+    try:
+        s = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        s.starttls()
+        s.login(EMAIL_USER, EMAIL_PASS)
+        s.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+        s.quit()
+    except Exception as e:
+        print(f"이메일 발송 실패: {e}")
+
+def save_trade_history(row):
+    file_path = os.path.join(os.path.dirname(__file__), "trade_history.csv")
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, "a", newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+class UpbitBot:
+    def __init__(self):
+        print(f"업비트 자동매매 오토봇 시작: {UPBIT_MARKET}")
+        if not UPBIT_ACCESS_KEY or not UPBIT_SECRET_KEY:
+            raise ValueError("UPBIT_ACCESS_KEY와 UPBIT_SECRET_KEY를 .env에 설정하세요.")
+        self.api = UpbitAPI(str(UPBIT_ACCESS_KEY), str(UPBIT_SECRET_KEY))
+        TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+        TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+        self.tg = None
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            self.tg = TelegramAlert(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        
+        self.coin_states = load_coin_states()  # ← 이 줄을 추가하세요
+
+        param_path = os.path.join(os.path.dirname(__file__), "strategy_params.json")
+        if os.path.exists(param_path):
+            with open(param_path) as f:
+                params = json.load(f)
+            MIN_EXPECTED_PROFIT = params.get("MIN_EXPECTED_PROFIT", 0.003)
+            MAX_TRADES_PER_DAY = params.get("MAX_TRADES_PER_DAY", 10)
+            TOP_N = params.get("TOP_N", 5)
+        else:
+            MIN_EXPECTED_PROFIT = 0.003
+            MAX_TRADES_PER_DAY = 10
+            TOP_N = 5
+
+    def run(self):
+        while True:
+            self.trade()
+
+    def trade(self):
         # 1. 잔고조회에 예외처리 적용
-        balances = safe_api_call(api.get_balance)
+        balances = safe_api_call(self.api.get_balance)
         if balances is None:
-            continue
+            return
 
         # 2. 시세조회에 예외처리 적용
         tickers = []
@@ -128,9 +180,9 @@ def main():
             elif float(b['balance']) > 0:
                 tickers.append(f"KRW-{b['currency']}")
         if tickers:
-            prices = safe_api_call(api.get_ticker, ",".join(tickers))
+            prices = safe_api_call(self.api.get_ticker, ",".join(tickers))
             if prices is None:
-                continue
+                return
             if isinstance(prices, dict):
                 prices = [prices]
             for b, t in zip(balances, prices):
@@ -139,12 +191,12 @@ def main():
 
         msg = f"[업비트 오토봇] 전체 평가금액(원화+코인): {total_krw:.2f} KRW"
         print(msg)
-        if tg:
-            tg.send(msg)
+        if self.tg:
+            self.tg.send(msg)
         if total_krw < 5000:
             print("매수 가능한 평가금액이 부족합니다.")
             time.sleep(60)
-            continue
+            return
 
         # 여기에 선언!
         max_per_coin = total_krw * 0.2
@@ -155,32 +207,32 @@ def main():
         loss_rate = (total_krw - main.initial_krw) / main.initial_krw
         msg = f"누적 수익률: {loss_rate*100:.2f}% (기준자산: {main.initial_krw:.2f} KRW)"
         print(msg)
-        if tg:
-            tg.send(msg)
+        if self.tg:
+            self.tg.send(msg)
         if loss_rate < -0.10:
             msg = "누적 손실 -10% 초과! 전체 자산 현금화(매도) 실행"
             print(msg)
-            if tg:
-                tg.send(msg)
+            if self.tg:
+                self.tg.send(msg)
             # 전체 코인 시장가 매도
             for b in balances:
                 if b['currency'] != 'KRW' and float(b['balance']) > 0:
                     market = f"KRW-{b['currency']}"
                     msg = f"시장가 전량매도: {market} {b['balance']}개"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
-                    sell_result = api.sell_market_order(market, float(b['balance']))
+                    if self.tg:
+                        self.tg.send(msg)
+                    sell_result = self.api.sell_market_order(market, float(b['balance']))
                     msg = f"매도 결과: {sell_result}"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
             msg = "10분 후 재시작"
             print(msg)
-            if tg:
-                tg.send(msg)
+            if self.tg:
+                self.tg.send(msg)
             time.sleep(600)
-            continue
+            return
         # 포트폴리오 자동 선정 (시장 상황 필터, 변동성/거래량/시총 고려, 기술적지표, 리밸런싱, 코인빌려주기)
         print("KRW마켓 전체 종목 조회 중...")
         markets = get_krw_markets()
@@ -224,8 +276,8 @@ def main():
 
             # 트레일링 스탑(예시: 10% 이상 수익 후 고점 대비 5% 하락 시 매도)
             trailing_stop = False
-            if market in coin_states and coin_states[market]["buy_price"]:
-                buy_price = coin_states[market]["buy_price"]
+            if market in self.coin_states and self.coin_states[market]["buy_price"]:
+                buy_price = float(self.coin_states[market]["buy_price"])
                 highest = max(prices)
                 if price_now > buy_price * 1.10 and price_now < highest * 0.95:
                     trailing_stop = True
@@ -270,41 +322,41 @@ def main():
                     if t['market'] in last_trade_time and now - last_trade_time[t['market']] < 1800:
                         msg = f"{t['market']} : 최근 30분 내 매매 이력, 매수 생략"
                         print(msg)
-                        if tg:
-                            tg.send(msg)
+                        if self.tg:
+                            self.tg.send(msg)
                         continue
                     # 1일 최대 매매 횟수 제한
                     if trade_count_per_day[today].get(t['market'], 0) >= MAX_TRADES_PER_DAY:
                         msg = f"{t['market']} : 1일 최대 매매 횟수 초과, 매수 생략"
                         print(msg)
-                        if tg:
-                            tg.send(msg)
+                        if self.tg:
+                            self.tg.send(msg)
                         continue
                     # 최소 기대수익률 조건(예시: 0.3%)
                     expected_profit = t['ret']
                     if expected_profit < MIN_EXPECTED_PROFIT:
                         msg = f"{t['market']} : 기대수익률 {expected_profit*100:.2f}% 미만, 매수 생략"
                         print(msg)
-                        if tg:
-                            tg.send(msg)
+                        if self.tg:
+                            self.tg.send(msg)
                         continue
                     if amount_per_coin < 5000:
                         msg = f"{t['market']} : {amount_per_coin} KRW (최소주문금액 미만, 매수 생략)"
                         print(msg)
-                        if tg:
-                            tg.send(msg)
+                        if self.tg:
+                            self.tg.send(msg)
                         continue
                     msg = f"[반등신호] {t['market']} : {amount_per_coin} KRW 매수 시도 및 코인빌려주기(렌딩) 실행"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
-                    buy_result = api.buy_market_order(t['market'], amount_per_coin)
+                    if self.tg:
+                        self.tg.send(msg)
+                    buy_result = self.api.buy_market_order(t['market'], amount_per_coin)
                     last_trade_time[t['market']] = now
                     trade_count_per_day[today][t['market']] = trade_count_per_day[today].get(t['market'], 0) + 1
                     msg = f"실제 매수 결과: {buy_result}"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     # 매수/매도 직후에 아래 코드 추가
                     coin_states = load_coin_states()
                     m = t['market']
@@ -339,41 +391,41 @@ def main():
                 if p['market'] in last_trade_time and now - last_trade_time[p['market']] < 1800:
                     msg = f"{p['market']} : 최근 30분 내 매매 이력, 매수 생략"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     continue
                 # 1일 최대 매매 횟수 제한
                 if trade_count_per_day[today].get(p['market'], 0) >= MAX_TRADES_PER_DAY:
                     msg = f"{p['market']} : 1일 최대 매매 횟수 초과, 매수 생략"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     continue
-                # 최소 기대수익률 조건(예시: 0.3%)
+                # 최소 기대수익률 조건(예: 0.3%)
                 expected_profit = p['return']
                 if expected_profit < MIN_EXPECTED_PROFIT:
                     msg = f"{p['market']} : 기대수익률 {expected_profit*100:.2f}% 미만, 매수 생략"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     continue
                 if amount < 5000:
                     msg = f"{p['market']} : {amount} KRW (최소주문금액 미만, 매수 생략)"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     continue
                 msg = f"{p['market']} : {amount} KRW (최대비중 적용)"
                 print(msg)
-                if tg:
-                    tg.send(msg)
-                buy_result = api.buy_market_order(p['market'], amount)
+                if self.tg:
+                    self.tg.send(msg)
+                buy_result = self.api.buy_market_order(p['market'], amount)
                 last_trade_time[p['market']] = now
                 trade_count_per_day[today][p['market']] = trade_count_per_day[today].get(p['market'], 0) + 1
                 msg = f"실제 매수 결과: {buy_result}"
                 print(msg)
-                if tg:
-                    tg.send(msg)
+                if self.tg:
+                    self.tg.send(msg)
                 # 매수/매도 직후에 아래 코드 추가
                 coin_states = load_coin_states()
                 m = p['market']
@@ -397,15 +449,21 @@ def main():
             for holding in current_holdings:
                 market = f"KRW-{holding}"
                 if market not in [p['market'] for p in portfolio]:
-                    msg = f"{market} : 포트폴리오 제외, 전량 매도"
-                    print(msg)
-                    if tg:
-                        tg.send(msg)
-                    sell_result = api.sell_market_order(market, float([b for b in balances if b['currency'] == holding][0]['balance']))
+                    # 예: 5% 이상 수익이면 절반만 매도
+                    buy_price = float(coin_states[market]["buy_price"])
+                    current_price = ... # 현재가 조회
+                    if current_price > buy_price * 1.05:
+                        amount = float([b for b in balances if b['currency'] == holding][0]['balance']) / 2
+                        msg = f"{market} : 5% 이상 수익, 절반 익절"
+                    else:
+                        amount = float([b for b in balances if b['currency'] == holding][0]['balance'])
+                        msg = f"{market} : 포트폴리오 제외, 전량 매도"
+                    # 매도 실행
+                    sell_result = self.api.sell_market_order(market, amount)
                     msg = f"매도 결과: {sell_result}"
                     print(msg)
-                    if tg:
-                        tg.send(msg)
+                    if self.tg:
+                        self.tg.send(msg)
             # 이후 새 포트폴리오 종목만 매수
         print("1분 후 다시 확인합니다...\n")
         time.sleep(60)
@@ -422,4 +480,5 @@ def select_portfolio(returns, total_krw, min_amount=5000, top_n=5):
     return selected
 
 if __name__ == "__main__":
-    main()
+    bot = UpbitBot()
+    bot.run()
