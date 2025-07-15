@@ -45,3 +45,23 @@ if __name__ == "__main__":
     returns = get_monthly_returns(markets)
     portfolio = select_portfolio(returns, 1000000)
     print(portfolio)
+    max_per_coin = 1000000 // len(portfolio)  # Assuming total balance is 1,000,000 KRW
+    tg = None  # 텔레그램 객체가 여기에 할당된다고 가정
+
+    for p in portfolio:
+        amount = min(p['amount'], max_per_coin)
+        if amount < 5000:
+            msg = f"{p['market']} : {amount} KRW (최소주문금액 미만, 매수 생략)"
+            print(msg)
+            if tg:
+                tg.send(msg)
+            continue
+        msg = f"{p['market']} : {amount} KRW (최대비중 적용)"
+        print(msg)
+        if tg:
+            tg.send(msg)
+        buy_result = api.buy_market_order(p['market'], amount)
+        msg = f"실제 매수 결과: {buy_result}"
+        print(msg)
+        if tg:
+            tg.send(msg)

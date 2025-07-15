@@ -15,14 +15,18 @@
             <th>코인</th>
             <th>매수가</th>
             <th>보유수량</th>
-            <th>최근 매매가</th>
+            <th>최근 매매시각</th>
+            <th>일일 매매횟수</th>
+            <th>체결상태</th>
         </tr>
         {% for coin, state in coin_states.items() %}
         <tr>
             <td>{{ coin }}</td>
             <td>{{ state.buy_price }}</td>
             <td>{{ state.bought_volume }}</td>
-            <td>{{ state.last_trade_price }}</td>
+            <td>{{ state.last_trade_time }}</td>
+            <td>{{ state.trade_count_today }}</td>
+            <td>{{ state.order_status if state.order_status is defined else '' }}</td>
         </tr>
         {% endfor %}
     </table>

@@ -14,6 +14,7 @@ from flask import Flask, render_template
 import smtplib
 from email.mime.text import MIMEText
 import csv
+import streamlit as st
 
 # 환경변수 로드
 load_dotenv()
@@ -33,8 +34,8 @@ trade_count_per_day = {}
 
 # 최소 기대수익률(예: 0.3%)
 MIN_EXPECTED_PROFIT = 0.003
-# 1일 최대 매매 횟수 제한
-MAX_TRADES_PER_DAY = 10
+# 1일 최대 매매 횟수 제한 (제한 없음)
+MAX_TRADES_PER_DAY = float('inf')
 
 state_path = "coin_states.json"
 
@@ -154,11 +155,11 @@ class UpbitBot:
             with open(param_path) as f:
                 params = json.load(f)
             MIN_EXPECTED_PROFIT = params.get("MIN_EXPECTED_PROFIT", 0.003)
-            MAX_TRADES_PER_DAY = params.get("MAX_TRADES_PER_DAY", 10)
+            MAX_TRADES_PER_DAY = float('inf')  # 제한 없음
             TOP_N = params.get("TOP_N", 5)
         else:
             MIN_EXPECTED_PROFIT = 0.003
-            MAX_TRADES_PER_DAY = 10
+            MAX_TRADES_PER_DAY = float('inf')  # 제한 없음
             TOP_N = 5
 
     def run(self):
@@ -166,6 +167,18 @@ class UpbitBot:
             self.trade()
 
     def trade(self):
+        param_path = os.path.join(os.path.dirname(__file__), "strategy_params.json")
+        if os.path.exists(param_path):
+            with open(param_path) as f:
+                params = json.load(f)
+            MIN_EXPECTED_PROFIT = params.get("MIN_EXPECTED_PROFIT", 0.003)
+            MAX_TRADES_PER_DAY = float('inf')
+            TOP_N = params.get("TOP_N", 5)
+        else:
+            MIN_EXPECTED_PROFIT = 0.003
+            MAX_TRADES_PER_DAY = float('inf')
+            TOP_N = 5
+
         # 1. 잔고조회에 예외처리 적용
         balances = safe_api_call(self.api.get_balance)
         if balances is None:
@@ -202,10 +215,11 @@ class UpbitBot:
         max_per_coin = total_krw * 0.2
 
         # 기준자산을 매번 현재 자산으로 갱신
-        main.initial_krw = total_krw
+        if not hasattr(self, 'initial_krw') or self.initial_krw == 0:
+            self.initial_krw = total_krw
 
-        loss_rate = (total_krw - main.initial_krw) / main.initial_krw
-        msg = f"누적 수익률: {loss_rate*100:.2f}% (기준자산: {main.initial_krw:.2f} KRW)"
+        loss_rate = (total_krw - self.initial_krw) / self.initial_krw
+        msg = f"누적 수익률: {loss_rate*100:.2f}% (기준자산: {self.initial_krw:.2f} KRW)"
         print(msg)
         if self.tg:
             self.tg.send(msg)
@@ -351,6 +365,23 @@ class UpbitBot:
                     if self.tg:
                         self.tg.send(msg)
                     buy_result = self.api.buy_market_order(t['market'], amount_per_coin)
+                    save_trade_history({
+                        "datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "type": "buy",
+                        "market": t['market'],
+                        "amount": amount_per_coin,
+                        "price": buy_result.get("price") if isinstance(buy_result, dict) else None,
+                        "volume": buy_result.get("volume") if isinstance(buy_result, dict) else None,
+                        "result": str(buy_result)
+                    })
+                    # --- 코인빌리기(렌딩) 자동화 예시 ---
+                    # 실제 업비트 렌딩 API가 있다면 아래처럼 호출
+                    # self.api.lend_coin(t['market'], amount_per_coin, lend_ratio=0.8, period=7)
+                    # 아래는 수동 신청 안내 메시지
+                    msg = f"[코인빌리기] {t['market']} {amount_per_coin}원 상당 코인 렌딩 신청: 업비트 렌딩 페이지에서 담보비율 80%로 신청하세요."
+                    print(msg)
+                    if self.tg:
+                        self.tg.send(msg)
                     last_trade_time[t['market']] = now
                     trade_count_per_day[today][t['market']] = trade_count_per_day[today].get(t['market'], 0) + 1
                     msg = f"실제 매수 결과: {buy_result}"
@@ -420,6 +451,23 @@ class UpbitBot:
                 if self.tg:
                     self.tg.send(msg)
                 buy_result = self.api.buy_market_order(p['market'], amount)
+                save_trade_history({
+                    "datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": "buy",
+                    "market": p['market'],
+                    "amount": amount,
+                    "price": buy_result.get("price") if isinstance(buy_result, dict) else None,
+                    "volume": buy_result.get("volume") if isinstance(buy_result, dict) else None,
+                    "result": str(buy_result)
+                })
+                # --- 코인빌리기(렌딩) 자동화 예시 ---
+                # 실제 업비트 렌딩 API가 있다면 아래처럼 호출
+                # self.api.lend_coin(p['market'], amount, lend_ratio=0.8, period=7)
+                # 아래는 수동 신청 안내 메시지
+                msg = f"[코인빌리기] {p['market']} {amount}원 상당 코인 렌딩 신청: 업비트 렌딩 페이지에서 담보비율 80%로 신청하세요."
+                print(msg)
+                if self.tg:
+                    self.tg.send(msg)
                 last_trade_time[p['market']] = now
                 trade_count_per_day[today][p['market']] = trade_count_per_day[today].get(p['market'], 0) + 1
                 msg = f"실제 매수 결과: {buy_result}"
@@ -449,7 +497,6 @@ class UpbitBot:
             for holding in current_holdings:
                 market = f"KRW-{holding}"
                 if market not in [p['market'] for p in portfolio]:
-                    # 예: 5% 이상 수익이면 절반만 매도
                     buy_price = float(coin_states[market]["buy_price"])
                     current_price = ... # 현재가 조회
                     if current_price > buy_price * 1.05:
@@ -479,6 +526,28 @@ def select_portfolio(returns, total_krw, min_amount=5000, top_n=5):
         })
     return selected
 
+# dashboard_streamlit.py
+st.sidebar.header("전략 파라미터 조정")
+min_expected_profit = st.sidebar.slider("최소 기대수익률(%)", 0.0, 5.0, 0.3, 0.1)
+max_trades_per_day = st.sidebar.number_input("1일 최대 매매 횟수", 1, 50, 10)
+top_n = st.sidebar.number_input("포트폴리오 종목 수", 1, 20, 5)
+if st.sidebar.button("적용"):
+    with open("strategy_params.json", "w") as f:
+        json.dump({
+            "MIN_EXPECTED_PROFIT": min_expected_profit / 100,
+            "MAX_TRADES_PER_DAY": int(max_trades_per_day),
+            "TOP_N": int(top_n)
+        }, f)
+    st.success("전략 파라미터가 저장되었습니다.")
+
 if __name__ == "__main__":
+    # 메일 발송 테스트
+    try:
+        send_error_mail("테스트 메일", "업비트 오토봇 메일 발송 테스트입니다.")
+        print("테스트 메일이 정상적으로 발송되었습니다.")
+    except Exception as e:
+        print(f"테스트 메일 발송 실패: {e}")
+
+    # 실제 자동매매 실행
     bot = UpbitBot()
     bot.run()
